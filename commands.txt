@@ -1,2 +1,15 @@
+create env:
+python -m venv .\forcast\
+python -m venv forcast  
+
 .\forcast\Scripts\activate
 
+pip install statsmodels
+pip install tensorflow  
+pip install keras    
+pip install xgboost     
+pip install seaborn 
+pip install matplotlib     
+pip uninstall matplotlib   
+pip install -U scikit-learn
+pip install pandas

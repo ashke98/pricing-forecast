@@ -1,166 +1,282 @@
+import pickle
+
 import pandas as pd
-import csv
+import numpy as np
 
-from helpers import *
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# last 12 months are part of the test set
-# rest of the data is used to train
-# using a min-max scaler, we will scale the data so that all of our variables fall within the range of -1 to 1
-# Reverse scaling: After running our models, we will use this helper function to reverse the scaling
-# we will save the root mean squared error (RMSE) and mean absolute error (MAE) of our predictions to compare performance of our five models
-def load_data(csv_path):
-    return pd.read_csv(csv_path)
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.ensemble import RandomForestRegressor
+from xgboost.sklearn import XGBRegressor
 
-def monthly_sales(data):    
+import keras
+from keras.layers import Dense
+from keras.models import Sequential
+from keras.layers import LSTM
+
+import statsmodels.api as sm
+
+model_scores = {}
+
+def load_data(file_name):
+    """Returns a pandas dataframe from a csv file."""
+    return pd.read_csv(file_name)
+
+def pre_process_data(data):
     data = data.copy()     
     # Drop the day indicator from the date column    
-    data.date = data.date.apply(lambda x: str(x)[:-3])     
+    #data.date = data.date.apply(lambda x: str(x)[:-3])     
     # Sum sales per month    
     data = data.groupby('date')['sales'].sum().reset_index()    
     data.date = pd.to_datetime(data.date)  
-    data.to_csv('data/monthly_data.csv')     
-    return data
+    data.to_csv('data/daily_data_2.csv')   
+
+def tts(data):
+    """Splits the data into train and test. Test set consists of the last 39
+    months of data.
+    """
+    data = data.drop(['sales', 'date'], axis=1)
+    print(data)
+    train, test = data[0:-39].values, data[-39:].values
+
+    return train, test
+
+def scale_data(train_set, test_set):
+    """Scales data using MinMaxScaler and separates data into X_train, y_train,
+    X_test, and y_test.
+    Keyword Arguments:
+    -- train_set: dataset used to train the model
+    -- test_set: dataset used to test the model
+    """
+
+    #apply Min Max Scaler
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    scaler = scaler.fit(train_set)
+
+    # reshape training set
+    train_set = train_set.reshape(train_set.shape[0], train_set.shape[1])
+    train_set_scaled = scaler.transform(train_set)
+
+    # reshape test set
+    test_set = test_set.reshape(test_set.shape[0], test_set.shape[1])
+    test_set_scaled = scaler.transform(test_set)
+
+    X_train, y_train = train_set_scaled[:, 1:], train_set_scaled[:, 0:1].ravel()
+    X_test, y_test = test_set_scaled[:, 1:], test_set_scaled[:, 0:1].ravel()
+
+    return X_train, y_train, X_test, y_test, scaler
 
 
-# Calculate difference in sales month over month
-def get_diff(data):
-    data['sales_diff'] = data.sales.diff()    
-    data = data.dropna()      
-    return data
+def undo_scaling(y_pred, x_test, scaler_obj, lstm=False):
+    """For visualizing and comparing results, undoes the scaling effect on
+    predictions.
+    Keyword arguments:
+    -- y_pred: model predictions
+    -- x_test: features from the test set used for predictions
+    -- scaler_obj: the scaler objects used for min-max scaling
+    -- lstm: indicate if the model run is the lstm. If True, additional
+             transformation occurs
+    """
 
-# ARIMA Model
-def generate_arima_data(data):
-    dt_data = data.set_index('date').drop('sales', axis=1)        
-    dt_data.dropna(axis=0)     
-    dt_data.to_csv('data/arima_df.csv')
-    return dt_data
+    #reshape y_pred
+    y_pred = y_pred.reshape(y_pred.shape[0], 1, 1)
 
-# Supervised Model
-def generate_supervised(data):
-    supervised_df = data.copy()
-    
-    #create column for each lag
-    for i in range(1,13):
-        col = 'lag_' + str(i)
-        supervised_df[col] = supervised_df['sales_diff'].shift(i)
-    
-    #drop null values
-    supervised_df = supervised_df.dropna().reset_index(drop=True)
-    supervised_df.to_csv('data/model_df.csv', index=False)
-    
-    return supervised_df
+    if not lstm:
+        x_test = x_test.reshape(x_test.shape[0], 1, x_test.shape[1])
 
-data = load_data("data/train.csv")
-monthly_data = monthly_sales(data)
+    #rebuild test set for inverse transform
+    pred_test_set = []
+    for index in range(0, len(y_pred)):
+        pred_test_set.append(np.concatenate([y_pred[index], x_test[index]],
+                                            axis=1))
 
-# means keep data to no be change-able
-stationary_df = get_diff(monthly_data)
+    #reshape pred_test_set
+    pred_test_set = np.array(pred_test_set)
+    pred_test_set = pred_test_set.reshape(pred_test_set.shape[0],
+                                          pred_test_set.shape[2])
 
-# set data for arima model -> datetime index
-print("Generating Arima Model")
-arima_data = generate_arima_data(stationary_df)
+    #inverse transform
+    pred_test_set_inverted = scaler_obj.inverse_transform(pred_test_set)
 
-# set data for supervised model -> lags as features
-print("Generating Supervised Model")
-model_df = generate_supervised(stationary_df)
+    return pred_test_set_inverted
 
-#################################################################################### MODELING
-# Regressive Models: Linear Regression, Random Forest Regression, XGBoost
+def predict_df(unscaled_predictions, original_df):
+    """Generates a dataframe that shows the predicted sales for each month
+    for plotting results.
+    Keyword arguments:
+    -- unscaled_predictions: the model predictions that do not have min-max or
+                             other scaling applied
+    -- original_df: the original monthly sales dataframe
+    """
+    #create dataframe that shows the predicted sales
+    result_list = []
+    sales_dates = list(original_df[-40:].date)
+    act_sales = list(original_df[-40:].sales)
+
+    for index in range(0, len(unscaled_predictions)):
+        result_dict = {}
+        result_dict['pred_value'] = int(unscaled_predictions[index][0] +
+                                        act_sales[index])
+        result_dict['date'] = sales_dates[index+1]
+        result_list.append(result_dict)
+
+    df_result = pd.DataFrame(result_list)
+
+    return df_result
+
+def get_scores(unscaled_df, original_df, model_name):
+    """Prints the root mean squared error, mean absolute error, and r2 scores
+    for each model. Saves all results in a model_scores dictionary for
+    comparison.
+    Keyword arguments:
+    -- unscaled_predictions: the model predictions that do not have min-max or
+                             other scaling applied
+    -- original_df: the original monthly sales dataframe
+    -- model_name: the name that will be used to store model scores
+    """
+    rmse = np.sqrt(mean_squared_error(original_df.sales[-39:], unscaled_df.pred_value[-39:]))
+    mae = mean_absolute_error(original_df.sales[-39:], unscaled_df.pred_value[-39:])
+    r2 = r2_score(original_df.sales[-39:], unscaled_df.pred_value[-39:])
+    model_scores[model_name] = [rmse, mae, r2]
+
+    print(f"RMSE: {rmse}")
+    print(f"MAE: {mae}")
+    print(f"R2 Score: {r2}")
+
+
+def plot_results(results, original_df, model_name):
+    """Plots predictions over original data to visualize results. Saves each
+    plot as a png.
+    Keyword arguments:
+    -- results: a dataframe with unscaled predictions
+    -- original_df: the original monthly sales dataframe
+    -- model_name: the name that will be used in the plot title
+    """
+    fig, ax = plt.subplots(figsize=(15, 5))
+    sns.lineplot(original_df.date, original_df.sales, data=original_df, ax=ax,
+                 label='Original', color='mediumblue')
+    sns.lineplot(results.date, results.pred_value, data=results, ax=ax,
+                 label='Predicted', color='red')
+    ax.set(xlabel="Date",
+           ylabel="Sales",
+           title=f"{model_name} Sales Forecasting Prediction")
+    ax.legend()
+    sns.despine()
+
+    plt.savefig(f'data/wallmart/model_output/{model_name}_forecast.png')
 
 def regressive_model(train_data, test_data, model, model_name):
-    
-    # Call helper functions to create X & y and scale data
-    X_train, y_train, X_test, y_test, scaler_object = scale_data(train_data, test_data)
-    
-    # Run regression model
+    """Runs regressive models in SKlearn framework. First calls scale_data
+    to split into X and y and scale the data. Then fits and predicts. Finally,
+    predictions are unscaled, scores are printed, and results are plotted and
+    saved.
+    Keyword arguments:
+    -- train_set: dataset used to train the model
+    -- test_set: dataset used to test the model
+    -- model: the sklearn model and model arguments in the form of
+              model(kwarga)
+    -- model_name: the name that will be used to store model scores and plotting
+    """
+
+    # Split into X & y and scale data
+    X_train, y_train, X_test, y_test, scaler_object = scale_data(train_data,
+                                                                 test_data)
+    # Run sklearn models
     mod = model
     mod.fit(X_train, y_train)
     predictions = mod.predict(X_test)
-    # Call helper functions to undo scaling & create prediction df
-    original_df = load_data('data/monthly_data.csv')
+
+    # Undo scaling to compare predictions against original data
+    original_df = load_data('data/wallmart/daily_data.csv')
     unscaled = undo_scaling(predictions, X_test, scaler_object)
     unscaled_df = predict_df(unscaled, original_df)
-    # Call helper functions to print scores and plot results
+
+    # print scores and plot results
     get_scores(unscaled_df, original_df, model_name)
     plot_results(unscaled_df, original_df, model_name)
 
-# Separate data into train and test sets
-print("train, test")
-train, test = tts(model_df)
-
-# Call model frame work for linear regression
-print("regressive_model -> LinearRegression")
-regressive_model(train, test, LinearRegression(),'LinearRegression')
-
-# Call model frame work for random forest regressor 
-print("regressive_model -> RandomForest")
-regressive_model(train, test, 
-                 RandomForestRegressor(n_estimators=100,
-                                       max_depth=20),        
-                                       'RandomForest')
-# Call model frame work for XGBoost
-print("regressive_model -> XGBoost")
-regressive_model(train, test, XGBRegressor(n_estimators=100,
-                                           learning_rate=0.2), 
-                                           'XGBoost')
-
-
-
-###############################################################
-
-# Long Short-Term Memory (LSTM)
-# For additional accuracy, seasonal features and additional model complexity can be added
 def lstm_model(train_data, test_data):
-    # Call helper functions to create X & y and scale data
+    """Runs a long-short-term-memory nueral net with 2 dense layers. Generates
+    predictions that are then unscaled. Scores are printed and results are
+    plotted and saved.
+    Keyword arguments:
+    -- train_set: dataset used to train the model
+    -- test_set: dataset used to test the model
+    """
+
+    # Split into X & y and scale data
     X_train, y_train, X_test, y_test, scaler_object = scale_data(train_data, test_data)
+
     X_train = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
     X_test = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+
     # Build LSTM
     model = Sequential()
-    model.add(LSTM(4, batch_input_shape=(1, X_train.shape[1], 
-                                         X_train.shape[2]), 
-                                         stateful=True))
+    model.add(LSTM(4, batch_input_shape=(1, X_train.shape[1], X_train.shape[2]), stateful=True))
     model.add(Dense(1))
     model.add(Dense(1))
     model.compile(loss='mean_squared_error', optimizer='adam')
-    model.fit(X_train, y_train, epochs=200, batch_size=1, verbose=1, 
-              shuffle=False)
+    model.fit(X_train, y_train, epochs=200, batch_size=1, verbose=1, shuffle=False)
     predictions = model.predict(X_test, batch_size=1)
-    # Call helper functions to undo scaling & create prediction df
-    original_df = load_data('data/monthly_data.csv')
-    unscaled = undo_scaling(predictions, X_test, scaler_object, 
-                            lstm=True)
+
+    # Undo scaling to compare predictions against original data
+    original_df = load_data('data/wallmart/daily_data.csv')
+    unscaled = undo_scaling(predictions, X_test, scaler_object, lstm=True)
     unscaled_df = predict_df(unscaled, original_df)
-    # Call helper functions to print scores and plot results
+
+    # print scores and plot results
     get_scores(unscaled_df, original_df, 'LSTM')
     plot_results(unscaled_df, original_df, 'LSTM')
 
 
 def sarimax_model(data):
-    # Model    
-    sar = sm.tsa.statespace.SARIMAX(data.sales_diff, order=(12, 0, 
-                                    0), seasonal_order=(0, 1, 0,  
-                                    12), trend='c').fit()
-    # Generate predictions    
-    start, end, dynamic = 40, 100, 7    
-    data['pred_value'] = sar.predict(start=start, end=end, 
-                                     dynamic=dynamic)     
-    # Call helper functions to undo scaling & create prediction df   
-    original_df = load_data('data/monthly_data.csv')
+    """Runs an arima model with 12 lags and yearly seasonal impact. Generates
+    dynamic predictions for last 12 months. Prints and saves scores and plots
+    results.
+    """
+    # Model
+    sar = sm.tsa.statespace.SARIMAX(data.sales_diff, order=(39, 0, 0),
+                                    seasonal_order=(0, 1, 0, 39),
+                                    trend='c').fit()
+
+    # Generate predictions
+    start, end, dynamic = 40, 100, 7
+    data['pred_value'] = sar.predict(start=start, end=end, dynamic=dynamic)
+
+    # Generate predictions dataframe
+    original_df = load_data('data/wallmart/daily_data.csv')
     unscaled_df = predict_df(data, original_df)
-    # Call helper functions to print scores and plot results   
-    get_scores(unscaled_df, original_df, 'ARIMA') 
+
+    # print scores and plot results
+    get_scores(unscaled_df, original_df, 'ARIMA')
     plot_results(unscaled_df, original_df, 'ARIMA')
 
-def create_results_df():
-    # Load pickled scores for each model
-    results_dict = pickle.load(open("model_scores.p", "rb"))
-    # Create pandas df 
-    results_df = pd.DataFrame.from_dict(results_dict, 
-                    orient='index', columns=['RMSE', 'MAE', 'R2'])
-    results_df = results_df.sort_values(by='RMSE',
-                     ascending=False).reset_index()
-    return results_df
+def main():
+    """Calls all functions to load data, run regression models, run lstm model,
+    and run arima model.
+    """
+    # Regression models
+    model_df = load_data('data/wallmart/model_df.csv')
+    train, test = tts(model_df)
 
+    # Sklearn
+    regressive_model(train, test, LinearRegression(), 'LinearRegression')
+    regressive_model(train, test, RandomForestRegressor(n_estimators=100, max_depth=20), 'RandomForest')
+    regressive_model(train, test, XGBRegressor(n_estimators=100, learning_rate=0.2, objective='reg:squarederror'),'XGBoost')
 
-results = create_results_df()
+    # # Keras
+    lstm_model(train, test)
+
+    # # Arima
+    ts_data = load_data('data/wallmart/arima_df.csv').set_index('date')
+    ts_data.index = pd.to_datetime(ts_data.index)
+
+    #sarimax_model(ts_data)
+
+main()
+
+# Save mmodel scores to compare all model results in results.py
+#pickle.dump(model_scores, open("model_scores.p", "wb"))
